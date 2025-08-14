@@ -1,3 +1,8 @@
+tb_traces/
+perf_logs/
+model_checkpoints/
+log/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
