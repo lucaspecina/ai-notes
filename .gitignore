@@ -2,6 +2,7 @@ tb_traces/
 perf_logs/
 model_checkpoints/
 log/
+bench_projects/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
