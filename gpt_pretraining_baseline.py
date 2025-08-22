@@ -17,6 +17,7 @@ import time
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
 
 # =========================
 # Configuración
@@ -174,7 +175,11 @@ class GPTModel(nn.Module):
         x = self.final_norm(x)
         logits = self.out_head(x)
         return logits
-
+    
+    # util simple
+    def get_num_params(self):
+        return sum(p.numel() for p in self.parameters())
+    
 # =========================
 # Funciones utilitarias
 # =========================
