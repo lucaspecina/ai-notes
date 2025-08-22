@@ -3,6 +3,7 @@ perf_logs/
 model_checkpoints/
 log/
 bench_projects/
+bench_log/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
