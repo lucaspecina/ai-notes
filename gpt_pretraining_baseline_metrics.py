@@ -187,6 +187,76 @@ class GPTModel(nn.Module):
         return sum(p.numel() for p in self.parameters())
     
 # =========================
+# Benchmarking y métricas
+# =========================
+
+# FLOPs pico de GPU (ajustar según tu GPU)
+GPU_FP32_PEAK_FLOPS = 26.7e12     # RTX 4000 Ada ~26.7 TFLOPs FP32
+GPU_TENSOR_PEAK_FLOPS = 327.6e12  # RTX 4000 Ada ~327.6 TFLOPs (bf16/fp16 tensor cores)
+
+def flops_per_token_training(gpt_cfg, num_params: int):
+    """
+    Estima FLOPs útiles por token en entrenamiento.
+    Aproximación tipo PaLM para entrenamiento por token:
+    phi = 6N + 12 * L * d * T
+    """
+    L = gpt_cfg["n_layers"]
+    d = gpt_cfg["emb_dim"]
+    T = gpt_cfg["context_length"]
+    N = int(num_params)
+    return 6*N + 12*L*d*T
+
+def estimate_mfu(tokens_per_sec, gpt_cfg, num_params, peak_flops=GPU_FP32_PEAK_FLOPS):
+    """Calcula Model FLOPs Utilization (MFU)"""
+    phi = flops_per_token_training(gpt_cfg, num_params)
+    achieved = tokens_per_sec * phi
+    return achieved / peak_flops
+
+def params_num_bytes(model):
+    """Calcula bytes totales de parámetros del modelo"""
+    total = 0
+    for p in model.parameters():
+        total += p.numel() * p.element_size()
+    return total
+
+def optimizer_state_num_bytes_exact(optimizer):
+    """
+    Mide exactamente los bytes de estados en optimizer.state (si ya hubo backward).
+    Si no hay estados todavía, retorna 0.
+    """
+    total = 0
+    for state in optimizer.state.values():
+        for v in state.values():
+            if torch.is_tensor(v):
+                total += v.numel() * v.element_size()
+    return total
+
+def reset_peak_memory_stats(device='cuda'):
+    """Resetea estadísticas de memoria pico"""
+    if device == 'cuda' and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+def memory_report(device='cuda'):
+    """Imprime reporte detallado de memoria CUDA"""
+    if device != 'cuda' or not torch.cuda.is_available():
+        return {}
+    dev = torch.cuda.current_device()
+    alloc = torch.cuda.memory_allocated(dev)
+    reserv = torch.cuda.memory_reserved(dev)
+    peak_a = torch.cuda.max_memory_allocated(dev)
+    peak_r = torch.cuda.max_memory_reserved(dev)
+    
+    print(f"[CUDA mem] allocated: {alloc/1e6:.1f} MB | reserved: {reserv/1e6:.1f} MB | "
+          f"peak_alloc: {peak_a/1e6:.1f} MB | peak_reserved: {peak_r/1e6:.1f} MB")
+    
+    return {
+        'allocated_mb': alloc/1e6,
+        'reserved_mb': reserv/1e6,
+        'peak_alloc_mb': peak_a/1e6,
+        'peak_reserved_mb': peak_r/1e6
+    }
+
+# =========================
 # Funciones utilitarias
 # =========================
 
@@ -286,12 +356,34 @@ def evaluate_model(model, train_loader, val_loader, device, eval_iter):
     model.train()
     return train_loss, val_loss
 
-def train(model, train_loader, val_loader, optimizer, device, num_runs, eval_freq, eval_iter, 
-          max_steps=None, checkpoint_path=None, save_chkpt=False):
+def train(model, train_loader, val_loader, optimizer, device, config, num_runs, eval_freq, eval_iter, 
+                      max_steps=None, checkpoint_path=None, save_chkpt=False, 
+                      flops_fn=None, peak_flops=GPU_FP32_PEAK_FLOPS, memory_freq=None):
+    """
+    Función de entrenamiento genérica con métricas detalladas.
+    
+    Args:
+        flops_fn: Función que calcula FLOPs por token (config, num_params) -> int. Si None, no calcula MFU
+        peak_flops: FLOPs pico de la GPU para calcular MFU
+        memory_freq: Cada cuántos steps mostrar memoria (None = solo al final)
+    """
     train_losses, val_losses, track_tokens = [], [], []
     total_tokens, global_step, last_tokens = 0, -1, 0
     cumulative_tokens, cumulative_time = 0.0, 0.0
     start_run = 0
+    
+    # Métricas del modelo
+    num_params = model.get_num_params()
+    param_bytes = params_num_bytes(model)
+    
+    print(f"\n{'='*60}")
+    print(f"MODEL METRICS")
+    print(f"{'='*60}")
+    print(f"#params: {num_params:,} ({num_params/1e6:.2f} M)")
+    print(f"Parámetros (bytes): {param_bytes/1e6:.1f} MB")
+    
+    # Resetear memoria pico antes de empezar
+    reset_peak_memory_stats(device)
     
     # Cargar checkpoint si existe
     if checkpoint_path is not None:
@@ -300,6 +392,10 @@ def train(model, train_loader, val_loader, optimizer, device, num_runs, eval_fre
             start_run = loaded_run + 1
             global_step = loaded_global_step
             print(f"Resuming training from run {start_run}, global step {global_step + 1}")
+    
+    print(f"\n{'='*60}")
+    print(f"TRAINING STARTED")
+    print(f"{'='*60}")
     
     use_cuda = device.type == "cuda"
     if use_cuda:
@@ -341,9 +437,20 @@ def train(model, train_loader, val_loader, optimizer, device, num_runs, eval_fre
                 train_losses.append(train_loss)
                 val_losses.append(val_loss)
                 track_tokens.append(total_tokens)
+                
+                # Calcular MFU si se proporciona función de FLOPs
+                mfu_str = ""
+                if flops_fn is not None:
+                    mfu = estimate_mfu(tps, config, num_params, peak_flops)
+                    mfu_str = f", MFU: {mfu*100:.1f}%"
+                
                 print(f"Run {run+1}, Step {global_step:06d}, "
                       f"Train: {train_loss:.3f}, Val: {val_loss:.3f}, "
-                      f"Step tok/sec: {round(tps)}, Avg tok/sec: {round(avg_tps)}")
+                      f"Step tok/sec: {round(tps)}, Avg tok/sec: {round(avg_tps)}{mfu_str}")
+                
+                # Reporte de memoria periódico si se especifica
+                if memory_freq and global_step % memory_freq == 0:
+                    memory_report(device)
                 if max_steps is not None and global_step >= max_steps:
                     print(f"Reached max steps: {max_steps}")
                     if save_chkpt and checkpoint_path:
@@ -353,12 +460,32 @@ def train(model, train_loader, val_loader, optimizer, device, num_runs, eval_fre
                     break
         if save_chkpt:
             save_checkpoint(model, optimizer, run, global_step, checkpoint_path)
-        if torch.cuda.is_available():
-            dev = torch.cuda.current_device()
-            allocated = torch.cuda.memory_allocated(dev) / 1024**3
-            reserved = torch.cuda.memory_reserved(dev) / 1024**3
-            print(f"\nAllocated memory: {allocated:.4f} GB")
-            print(f"Reserved memory: {reserved:.4f} GB\n")
+    
+    # Reporte final completo
+    print(f"\n{'='*60}")
+    print(f"TRAINING COMPLETED - FINAL METRICS")
+    print(f"{'='*60}")
+    
+    # Métricas de optimizer state
+    opt_bytes = optimizer_state_num_bytes_exact(optimizer)
+    if opt_bytes > 0:
+        print(f"Optimizer state (bytes): {opt_bytes/1e6:.1f} MB")
+    
+    # Timing final
+    if cumulative_time > 0:
+        final_tps = cumulative_tokens / cumulative_time
+        print(f"Avg step time: {(cumulative_time * 1000 / max(1, global_step + 1)):.2f} ms")
+        print(f"Tokens/s: {final_tps:,.0f}")
+        
+        # MFU final
+        if flops_fn is not None:
+            final_mfu = estimate_mfu(final_tps, config, num_params, peak_flops)
+            print(f"MFU (peak = {peak_flops/1e12:.1f} TFLOPs): {final_mfu*100:.2f}%")
+    
+    # Reporte final de memoria
+    memory_report(device)
+    print(f"{'='*60}")
+    
     return train_losses, val_losses, track_tokens
 
 # =========================
@@ -366,13 +493,34 @@ def train(model, train_loader, val_loader, optimizer, device, num_runs, eval_fre
 # =========================
 
 def run(gpt_config, settings, train_model=True, max_steps=None, num_runs=1, 
-        eval_freq=100, save_checkpoint=True, load_existing=True):
-    # Set seed
+                           eval_freq=100, save_checkpoint=True, load_existing=True,
+                           flops_fn=flops_per_token_training, peak_flops=GPU_FP32_PEAK_FLOPS, memory_freq=50):
+    """
+    Versión avanzada de run() con control total sobre las métricas.
+    
+    Args:
+        flops_fn: Función personalizada para calcular FLOPs (config, num_params) -> int
+                 Si None, no se calcula MFU
+        peak_flops: FLOPs pico de tu GPU para MFU
+        memory_freq: Cada cuántos steps mostrar memoria (None = solo al final)
+    
+    Examples:
+        # Con MFU usando función por defecto
+        run(config, settings, max_steps=100)
+        
+        # Sin MFU (más rápido)
+        run(config, settings, max_steps=100, flops_fn=None)
+        
+        # Con memoria cada 50 steps
+        run(config, settings, max_steps=100, memory_freq=50)
+        
+        # GPU diferente
+        run(config, settings, peak_flops=40e12)  # RTX 4090
+    """
+    # Usar misma lógica que run() pero con parámetros personalizados
     torch.manual_seed(settings["seed"])
     device = settings["device"]
-    
-    # Asegurar consistencia en configuraciones de device
-    gpt_config = gpt_config.copy()  # No modificar el original
+    gpt_config = gpt_config.copy()
     gpt_config["device"] = device
 
     # Load data
@@ -386,27 +534,13 @@ def run(gpt_config, settings, train_model=True, max_steps=None, num_runs=1,
     vocab_size = tokenizer.vocab_size
     gpt_config["vocab_size"] = vocab_size
 
-    # Config prints
     checkpoint_path = get_checkpoint_filename(gpt_config)
-    print(f"PyTorch version: {torch.__version__}")
-    print(f"Using {device}")
-    if torch.cuda.is_available():
-        print(f"CUDA version: {torch.version.cuda}")
-    print(f'Vocabulary size: {vocab_size}')
-    print(f'Checkpoint path: {checkpoint_path}')
-
-    # Initialize model
     model = GPTModel(gpt_config)
     model.to(device)
-    
-    # Print model info
-    total_params = model.get_num_params()
-    print(f"Model initialized with {total_params:,} parameters")
     
     train_losses, val_losses = [], []
     
     if train_model:
-        # Preparar datos para entrenamiento
         data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
         n = int(0.9 * len(data))
         train_data = data[:n]
@@ -417,37 +551,30 @@ def run(gpt_config, settings, train_model=True, max_steps=None, num_runs=1,
         train_loader = DataLoader(train_dataset, batch_size=settings["batch_size"], shuffle=True, num_workers=0)
         val_loader = DataLoader(val_dataset, batch_size=settings["batch_size"], shuffle=False, num_workers=0)
         
-        print(f'Number of batches train (per epoch): {len(train_loader)}')
-        
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=settings["learning_rate"],
             weight_decay=settings["weight_decay"]
         )
 
-        # Train model
-        print(f"\n{'='*50}")
-        print(f"TRAINING STARTED")
-        print(f"Max steps: {max_steps if max_steps else 'No limit'}")
-        print(f"Num runs: {num_runs}")
-        print(f"{'='*50}")
-        
         train_losses, val_losses, _ = train(
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
             optimizer=optimizer,
             device=device,
+            config=gpt_config,
             num_runs=num_runs,
             eval_freq=eval_freq,
             eval_iter=1,
             max_steps=max_steps,
             checkpoint_path=checkpoint_path if load_existing else None,
-            save_chkpt=save_checkpoint
+            save_chkpt=save_checkpoint,
+            flops_fn=flops_fn,
+            peak_flops=peak_flops,
+            memory_freq=memory_freq
         )
-        print(f"TRAINING COMPLETED")
     else:
-        # Solo cargar modelo existente
         if load_existing and os.path.isfile(checkpoint_path):
             optimizer = torch.optim.AdamW(model.parameters(), lr=settings["learning_rate"])
             run, global_step = load_checkpoint(model, optimizer, checkpoint_path)
@@ -456,12 +583,3 @@ def run(gpt_config, settings, train_model=True, max_steps=None, num_runs=1,
             print("Using untrained model")
     
     return model, tokenizer, device
-# {
-#         'model': model,
-#         'tokenizer': tokenizer, 
-#         'device': device,
-#         'train_losses': train_losses,
-#         'val_losses': val_losses,
-#         'config': gpt_config,
-#         'checkpoint_path': checkpoint_path
-#     }
