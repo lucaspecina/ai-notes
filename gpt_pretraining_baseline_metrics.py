@@ -392,6 +392,12 @@ def train(model, train_loader, val_loader, optimizer, device, config, num_runs, 
             start_run = loaded_run + 1
             global_step = loaded_global_step
             print(f"Resuming training from run {start_run}, global step {global_step + 1}")
+            
+            # Ajustar max_steps si el checkpoint ya pasó el límite
+            if max_steps is not None and global_step >= max_steps:
+                original_max_steps = max_steps
+                max_steps = global_step + original_max_steps
+                print(f"Checkpoint is at step {global_step + 1}, extending training for {original_max_steps} more steps (until step {max_steps})")
     
     print(f"\n{'='*60}")
     print(f"TRAINING STARTED")
