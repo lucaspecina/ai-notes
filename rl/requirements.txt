@@ -1,0 +1,27 @@
+# instalar torch con cuda
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+
+# Core ML libraries
+numpy>=1.24.0
+
+# Transformers ecosystem (Qwen3 requires Transformers >= 4.51)
+transformers==4.51.3
+accelerate==1.4.0
+peft==0.14.0
+datasets==3.3.2
+evaluate==0.4.3
+
+# Tokenization & serialization
+sentencepiece
+protobuf
+
+# Data manipulation & visualization
+pandas
+matplotlib
+tqdm
+pillow>=7.1.0,<11.0.0  # Compatible with streamlit
+
+# Jupyter/IPython (for notebook display features)
+ipython
+jupyter
+
